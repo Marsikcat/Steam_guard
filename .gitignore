@@ -1,0 +1,13 @@
+/build/
+.vs/
+**/obj/
+**/bin/
+*.user
+*.maFile
+*.mafile
+accounts.dat
+accounts.pending
+instance.lock
+.env
+*.pfx
+*.key
