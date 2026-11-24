@@ -74,6 +74,10 @@ namespace LocalSteamGuard
         private readonly TextBox first;
         private readonly TextBox second;
         private readonly Button next;
+        private readonly TableLayoutPanel columns;
+        private readonly TableLayoutPanel loginFields;
+        private readonly Panel separator;
+        private readonly QrSignInPanel qrPanel;
         private readonly Button close;
         private readonly Label feedback;
         private SteamLogin login;
@@ -89,10 +93,27 @@ namespace LocalSteamGuard
             this.isPresent = isPresent;
             this.checkVault = checkVault;
             this.save = save;
-            SteamUi.StyleDialog(this, "Подключить аккаунт Steam", 550, 363);
-            var layout = Theme.Rows(32, 73, 24, 32, 24, 32, 0, 39);
-            layout.Padding = new Padding(21, 16, 21, 15);
-            Controls.Add(layout);
+            SteamUi.StyleDialog(this, "Подключить аккаунт Steam", 856, 511);
+            columns = new TableLayoutPanel
+            {
+                ColumnCount = 3, RowCount = 1, Dock = DockStyle.Fill,
+                Padding = new Padding(22, 16, 22, 16)
+            };
+            columns.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52));
+            columns.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 1));
+            columns.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48));
+            columns.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            Controls.Add(columns);
+
+            loginFields = Theme.Rows(43, 63, 26, 35, 26, 35, 0, 41);
+            columns.Controls.Add(loginFields, 0, 0);
+            var layout = loginFields;
+            separator = new Panel { Dock = DockStyle.Fill, BackColor = Theme.Field, Margin = Padding.Empty };
+            columns.Controls.Add(separator, 1, 0);
+            qrPanel = new QrSignInPanel(api);
+            qrPanel.SignedIn += CompleteQrSignIn;
+            columns.Controls.Add(qrPanel, 2, 0);
+            Shown += delegate { StartQr(); };
 
             heading = Theme.Label("", Theme.Account, Theme.Text);
             instruction = Theme.Label("", Theme.Body, Theme.Muted);
@@ -136,7 +157,10 @@ namespace LocalSteamGuard
                     Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes;
             }
             if (!e.Cancel)
+            {
+                qrPanel.Stop();
                 stop.Cancel();
+            }
             base.OnFormClosing(e);
         }
 
@@ -156,7 +180,7 @@ namespace LocalSteamGuard
             {
                 case Step.Login:
                     title = "Вход в Steam";
-                    text = "Войди в аккаунт, на котором уже включён Steam Guard. Подтверди вход в Steam Mobile, если Steam запросит это.";
+                    text = "Введи логин и пароль аккаунта с действующим Steam Guard.";
                     button = "Войти";
                     label = "Логин Steam";
                     break;
@@ -175,7 +199,7 @@ namespace LocalSteamGuard
                     break;
                 case Step.SendSms:
                     title = "Перенос на этот ПК";
-                    text = "Steam отправит SMS на номер аккаунта. После переноса телефон перестанет выдавать коды для него, а обмены и Торговая площадка будут ограничены на 2 дня.";
+                    text = "Аккаунт " + login.Name + ". Steam отправит SMS на его номер. После переноса телефон перестанет выдавать коды для него, а обмены и Торговая площадка будут ограничены на 2 дня.";
                     button = "Отправить SMS";
                     break;
                 case Step.EnterSms:
@@ -213,6 +237,14 @@ namespace LocalSteamGuard
             heading.Text = title;
             instruction.Text = text;
             next.Text = button;
+            bool choosingLogin = value == Step.Login;
+            columns.SuspendLayout();
+            qrPanel.Visible = separator.Visible = choosingLogin;
+            loginFields.Padding = choosingLogin ? new Padding(0, 0, 22, 0) : new Padding(25, 0, 25, 0);
+            columns.SetColumnSpan(loginFields, choosingLogin ? 1 : 3);
+            columns.ResumeLayout(true);
+            if (!choosingLogin)
+                qrPanel.Stop();
             close.Visible = value != Step.Done && value != Step.Uncertain;
             first.Visible = firstLabel.Visible = label.Length > 0;
             firstLabel.Text = label;
@@ -222,6 +254,25 @@ namespace LocalSteamGuard
                 first.Focus();
             else
                 next.Focus();
+        }
+
+        private async void StartQr()
+        {
+            if (step == Step.Login && !IsDisposed)
+                await qrPanel.LoadCode();
+        }
+
+        private void CompleteQrSignIn(SteamLogin session)
+        {
+            if (step != Step.Login || busy)
+                return;
+            if (isPresent(session.SteamId))
+            {
+                qrPanel.Stop("Этот аккаунт уже подключён на этом ПК.");
+                return;
+            }
+            login = session;
+            Display(Step.SendSms);
         }
 
         private async Task Advance()
@@ -252,6 +303,11 @@ namespace LocalSteamGuard
 
             busy = true;
             next.Enabled = first.Enabled = second.Enabled = false;
+            if (started == Step.Login)
+            {
+                qrPanel.Enabled = false;
+                qrPanel.Stop("Выполняется вход по паролю…");
+            }
             protectCommit = step == Step.EnterSms || step == Step.Save;
             close.Enabled = !protectCommit;
             feedback.Text = step == Step.ConfirmLogin ? "Ожидаю подтверждение от Steam…" : "Выполняю запрос…";
@@ -317,7 +373,12 @@ namespace LocalSteamGuard
             {
                 busy = protectCommit = false;
                 if (!IsDisposed)
+                {
                     next.Enabled = close.Enabled = first.Enabled = second.Enabled = true;
+                    qrPanel.Enabled = true;
+                    if (started == Step.Login && step == Step.Login)
+                        StartQr();
+                }
             }
         }
 

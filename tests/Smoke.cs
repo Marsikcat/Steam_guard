@@ -18,6 +18,19 @@ internal static class Smoke
     [STAThread]
     private static void Main(string[] args)
     {
+        if (args.Length == 1 && args[0] == "--probe-qr")
+        {
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            using (var steam = new SteamApi())
+            {
+                var session = steam.BeginQrLogin(CancellationToken.None).GetAwaiter().GetResult();
+                Check(session.QrUrl.StartsWith("https://s.team/q/", StringComparison.Ordinal), "Live Steam QR origin");
+                new QrCode(session.QrUrl);
+            }
+            Console.WriteLine("Steam issued a live QR login challenge. No account signed in.");
+            return;
+        }
+
         var secret = Encoding.ASCII.GetBytes("12345678901234567890");
         Check(GuardCode.Generate(secret, 29) == "GG5F5" && GuardCode.Generate(secret, 30) == "PV9M4"
             && GuardCode.Generate(secret, 60) == "B26KJ", "Code window boundaries");
@@ -60,15 +73,141 @@ internal static class Smoke
                 }
             }
 
-            using (var dialog = new ConnectionDialog(api, id => false, () => { }, account => account))
-            {
-                ShowOffscreen(dialog);
-                Check(Field<TextBox>(dialog, "second").UseSystemPasswordChar, "Password is masked");
-                Capture(dialog, Path.Combine(isolated, "connect.png"));
-            }
+
         }
-        Console.WriteLine("Protocol, Steam transfer and approvals with fixtures, DPAPI, and Windows UI checks passed.");
+        using (var api = new SteamApi(new QrFixture(FirstQr), () => "Fixture QR client"))
+        using (var dialog = new ConnectionDialog(api, id => false, () => { }, account => account))
+        {
+            ShowOffscreen(dialog);
+            Application.DoEvents();
+            var panel = Field<QrSignInPanel>(dialog, "qrPanel");
+            var password = Field<TextBox>(dialog, "second");
+            Check(panel.Visible && password.Visible && password.UseSystemPasswordChar,
+                "QR and masked password are available in the same window");
+            Check(Field<Label>(panel, "status").Text.StartsWith("Ожидаю", StringComparison.Ordinal),
+                "QR renders while waiting for Steam Mobile");
+            Capture(dialog, Path.Combine(isolated, "connect.png"));
+            Field<TextBox>(dialog, "first").Text = "unsent-login";
+            password.Text = "unsent-test-password";
+            var until = System.Diagnostics.Stopwatch.StartNew();
+            while (panel.Visible && until.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                Application.DoEvents();
+                Thread.Sleep(15);
+            }
+            Check(!panel.Visible && password.TextLength == 0
+                && Field<Label>(dialog, "heading").Text == "Перенос на этот ПК"
+                && Field<Label>(dialog, "instruction").Text.Contains("fixture"),
+                "Confirmed QR advances to SMS consent and clears unsent credentials");
+            dialog.Close();
+            Application.DoEvents();
+        }
+        TestQr(isolated).GetAwaiter().GetResult();
+        Console.WriteLine("QR sign-in, protocol, transfer, approvals, DPAPI, and Windows UI checks passed with fixtures.");
         Console.WriteLine(isolated);
+    }
+
+    private const string FirstQr = "https://s.team/q/1/4242424242";
+    private const string NextQr = "https://s.team/q/1/4242424243";
+
+    private static async Task TestQr(string isolated)
+    {
+        using (var fixture = new QrFixture(FirstQr))
+        using (var api = new SteamApi(fixture, () => "Fixture QR client"))
+        {
+            var cancel = CancellationToken.None;
+            var login = await api.BeginQrLogin(cancel).ConfigureAwait(false);
+            Check(login.QrUrl == FirstQr && login.SteamId == 0, "QR starts without an account");
+            login.Interval = TimeSpan.Zero;
+            var changes = new System.Collections.Generic.List<string>();
+            await api.WaitForLogin(login, cancel, new QrChanges(changes)).ConfigureAwait(false);
+            Check(changes.SequenceEqual(new[] { NextQr }) && fixture.Polls == 2, "Steam rotates active QR code");
+            Check(login.SteamId == SteamFixture.SteamId && login.Name == "fixture"
+                && login.AccessToken == "access-fixture", "Steam identifies QR-authenticated account");
+        }
+
+        using (var fixture = new QrFixture("https://s.team.example/q/1/4242424242"))
+        using (var api = new SteamApi(fixture, () => "Fixture QR client"))
+        {
+            try
+            {
+                await api.BeginQrLogin(CancellationToken.None).ConfigureAwait(false);
+                throw new Exception("Untrusted QR origin accepted");
+            }
+            catch (InvalidDataException) { }
+        }
+
+        WriteQr(FirstQr, Path.Combine(isolated, "qr.png"));
+        string max = FirstQr + "?" + new string('a', QrCode.MaxBytes - FirstQr.Length - 1);
+        WriteQr(max, Path.Combine(isolated, "qr-max.png"));
+        try { new QrCode(max + "z"); throw new Exception("Oversized QR payload accepted"); }
+        catch (ArgumentException) { }
+    }
+
+    private static void WriteQr(string data, string path)
+    {
+        var code = new QrCode(data);
+        const int scale = 6;
+        const int border = 4;
+        int width = (QrCode.Size + 2 * border) * scale;
+        using (var image = new Bitmap(width, width))
+        using (var graphics = Graphics.FromImage(image))
+        {
+            graphics.Clear(Color.White);
+            for (int y = 0; y < QrCode.Size; y++)
+                for (int x = 0; x < QrCode.Size; x++)
+                    if (code.IsDark(x, y))
+                        graphics.FillRectangle(Brushes.Black, (x + border) * scale, (y + border) * scale, scale, scale);
+            image.Save(path, ImageFormat.Png);
+        }
+    }
+
+    private sealed class QrChanges : IProgress<string>
+    {
+        private readonly System.Collections.Generic.List<string> changes;
+        public QrChanges(System.Collections.Generic.List<string> changes) { this.changes = changes; }
+        public void Report(string value) { changes.Add(value); }
+    }
+
+    private sealed class QrFixture : HttpMessageHandler
+    {
+        private readonly string qr;
+        public int Polls;
+        public QrFixture(string qr) { this.qr = qr; }
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
+        {
+            Check(request.RequestUri.Host == "api.steampowered.com" && request.Method == HttpMethod.Post, "QR uses Steam API");
+            string payload = await ReadForm(request.Content).ConfigureAwait(false);
+            var input = new SteamWire.Reply(Convert.FromBase64String(payload));
+            var output = new SteamWire();
+            string method = request.RequestUri.Segments[2].Trim('/');
+            if (method == "BeginAuthSessionViaQR")
+            {
+                Check(input.Text(1) == "Fixture QR client" && input.Number(2) == 3
+                    && new SteamWire.Reply(input.Bytes(3)).Number(2) == 3, "QR opens mobile login without credentials");
+                output.Number(1, 11).Text(2, qr).Bytes(3, new byte[] { 8, 9 });
+            }
+            else
+            {
+                Check(method == "PollAuthSessionStatus" && input.Bytes(2).SequenceEqual(new byte[] { 8, 9 }), "QR polling request");
+                Polls++;
+                if (Polls == 1)
+                {
+                    Check(input.Number(1) == 11, "Original client ID");
+                    output.Number(1, 12).Text(2, NextQr);
+                }
+                else
+                {
+                    Check(input.Number(1) == 12, "New client ID after rotation");
+                    string body = "{\"sub\":\"76561198000000000\"}";
+                    string subject = Convert.ToBase64String(Encoding.UTF8.GetBytes(body)).TrimEnd('=');
+                    output.Text(3, "fixture." + subject + ".test").Text(4, "access-fixture").Text(6, "fixture");
+                }
+            }
+            var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(output.ToArray()) };
+            response.Headers.Add("x-eresult", "1");
+            return response;
+        }
     }
 
     private static async Task<Account> TestTransferAndRequests(SteamApi api, SteamFixture fake)
@@ -140,7 +279,7 @@ internal static class Smoke
             if (request.Method == HttpMethod.Get)
                 payload = Query(uri, "input_protobuf_encoded").Replace('-', '+').Replace('_', '/');
             else
-                payload = await ((MultipartFormDataContent)request.Content).Single().ReadAsStringAsync().ConfigureAwait(false);
+                payload = await ReadForm(request.Content).ConfigureAwait(false);
             var input = new SteamWire.Reply(Convert.FromBase64String(payload));
             var output = new SteamWire();
             string call = uri.Segments[2].Trim('/');
@@ -214,6 +353,14 @@ internal static class Smoke
         }
 
         private static string Hex(byte[] bytes) { return BitConverter.ToString(bytes).Replace("-", ""); }
+    }
+
+    private static async Task<string> ReadForm(HttpContent content)
+    {
+        const string field = "input_protobuf_encoded=";
+        string form = await content.ReadAsStringAsync().ConfigureAwait(false);
+        Check(form.StartsWith(field, StringComparison.Ordinal), "Steam Web API form");
+        return Uri.UnescapeDataString(form.Substring(field.Length));
     }
 
     private static void ShowOffscreen(Form window)

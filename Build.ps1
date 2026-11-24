@@ -14,6 +14,7 @@ $manifest = Join-Path $PSScriptRoot 'src\app.manifest'
 $options = @(
     '/nologo', '/platform:anycpu', '/optimize+', '/warnaserror+', '/codepage:65001',
     "/win32manifest:$manifest",
+    "/win32icon:$(Join-Path $PSScriptRoot 'src\SteamGuard.ico')",
     '/reference:System.Drawing.dll', '/reference:System.Windows.Forms.dll',
     '/reference:System.Runtime.Serialization.dll', '/reference:System.Security.dll',
     '/reference:System.Xml.dll', '/reference:System.Net.Http.dll'
@@ -32,4 +33,6 @@ if ($Check) {
     if ($LASTEXITCODE -ne 0) { throw 'Smoke tests failed.' }
 }
 
-Get-Item -LiteralPath $app
+$portable = Join-Path $PSScriptRoot 'SteamGuard.exe'
+Copy-Item -LiteralPath $app -Destination $portable -Force
+Get-Item -LiteralPath $portable

@@ -39,6 +39,7 @@ namespace LocalSteamGuard
         public byte[] RequestId;
         public TimeSpan Interval;
         public HashSet<ulong> Confirmations;
+        public string QrUrl;
         public string AccessToken;
         public string RefreshToken;
     }
@@ -101,7 +102,7 @@ namespace LocalSteamGuard
 
             string description = deviceName();
             // Steam's authenticator service issues enrolment sessions for the mobile platform.
-            var device = new SteamWire().Text(1, description).Number(2, 3).Number(3, unchecked((ulong)-500)).Number(4, 528);
+            var device = MobileDevice(description);
             var request = new SteamWire().Text(1, description).Text(2, login).Text(3, encrypted)
                 .Number(4, rsa.Number(3)).Number(5, 1).Number(6, 3).Number(7, 1)
                 .Text(8, "Mobile").Bytes(9, device.ToArray()).Number(11, 0).Number(12, 2);
@@ -117,13 +118,81 @@ namespace LocalSteamGuard
             return result;
         }
 
+        private static SteamWire MobileDevice(string name)
+        {
+            return new SteamWire().Text(1, name).Number(2, 3).Number(3, unchecked((ulong)-500)).Number(4, 528);
+        }
+
+        public async Task<SteamLogin> BeginQrLogin(CancellationToken cancel)
+        {
+            string description = deviceName();
+            var request = new SteamWire().Text(1, description).Number(2, 3)
+                .Bytes(3, MobileDevice(description).ToArray()).Text(4, "Mobile");
+            var reply = await Call(Auth, "BeginAuthSessionViaQR", request, null, false, cancel).ConfigureAwait(false);
+            var login = new SteamLogin
+            {
+                ClientId = reply.Number(1), QrUrl = ValidQrUrl(reply.Text(2)), RequestId = reply.Bytes(3),
+                Interval = TimeSpan.FromSeconds(Math.Max(2, Math.Min(15, reply.Float(4))))
+            };
+            if (login.ClientId == 0 || login.RequestId.Length == 0)
+                throw new InvalidDataException("Steam не открыл QR-сеанс.");
+            return login;
+        }
+
+        private static string ValidQrUrl(string raw)
+        {
+            Uri url;
+            if (!Uri.TryCreate(raw, UriKind.Absolute, out url) || url.Scheme != Uri.UriSchemeHttps
+                || !string.Equals(url.Host, "s.team", StringComparison.OrdinalIgnoreCase)
+                || !url.IsDefaultPort || url.UserInfo.Length != 0 || url.Fragment.Length != 0
+                || Encoding.UTF8.GetByteCount(raw) > QrCode.MaxBytes)
+                throw new InvalidDataException("Steam прислал неожиданный адрес QR-кода.");
+            string[] parts = url.AbsolutePath.Split('/');
+            if (parts.Length != 4 || parts[1] != "q" || !Digits(parts[2]) || !Digits(parts[3]))
+                throw new InvalidDataException("Steam прислал неожиданный адрес QR-кода.");
+            return raw;
+        }
+
+        [DataContract]
+        private sealed class TokenIdentity
+        {
+            [DataMember(Name = "sub")] public string Subject { get; set; }
+        }
+
+        // The token is returned directly by Steam over HTTPS. This reads its subject;
+        // downstream Steam API calls still use the original token.
+        private static ulong SteamIdFromToken(string token)
+        {
+            string[] parts = token.Split('.');
+            if (parts.Length != 3 || parts[1].Length > 8192)
+                throw new InvalidDataException("Steam не указал аккаунт.");
+            var payload = parts[1].Replace('-', '+').Replace('_', '/');
+            payload = payload.PadRight(payload.Length + (4 - payload.Length % 4) % 4, '=');
+            try
+            {
+                using (var stream = new MemoryStream(Convert.FromBase64String(payload), false))
+                {
+                    var identity = (TokenIdentity)new DataContractJsonSerializer(typeof(TokenIdentity)).ReadObject(stream);
+                    ulong id;
+                    if (identity != null && ulong.TryParse(identity.Subject, NumberStyles.None,
+                        CultureInfo.InvariantCulture, out id) && id != 0)
+                        return id;
+                }
+            }
+            catch (FormatException error)
+            {
+                throw new InvalidDataException("Steam не указал аккаунт.", error);
+            }
+            throw new InvalidDataException("Steam не указал аккаунт.");
+        }
+
         public async Task SubmitLoginCode(SteamLogin login, string code, ulong method, CancellationToken cancel)
         {
             var request = new SteamWire().Number(1, login.ClientId).Fixed64(2, login.SteamId).Text(3, code).Number(4, method);
             await Call(Auth, "UpdateAuthSessionWithSteamGuardCode", request, null, false, cancel).ConfigureAwait(false);
         }
 
-        public async Task WaitForLogin(SteamLogin login, CancellationToken cancel)
+        public async Task WaitForLogin(SteamLogin login, CancellationToken cancel, IProgress<string> qrChanged = null)
         {
             for (int attempt = 0; attempt < 90; attempt++)
             {
@@ -135,16 +204,27 @@ namespace LocalSteamGuard
                 string refresh = reply.Text(3);
                 if (!string.IsNullOrEmpty(refresh))
                 {
+                    if (login.SteamId == 0)
+                        login.SteamId = SteamIdFromToken(refresh);
                     login.RefreshToken = refresh;
                     login.AccessToken = reply.Text(4);
                     if (string.IsNullOrEmpty(login.AccessToken))
                         login.AccessToken = await AccessToken(login.SteamId, refresh, cancel).ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(reply.Text(6)))
                         login.Name = reply.Text(6);
+                    else if (string.IsNullOrWhiteSpace(login.Name))
+                        login.Name = login.SteamId.ToString(CultureInfo.InvariantCulture);
                     return;
                 }
                 if (!string.IsNullOrEmpty(reply.Text(8)))
                     throw new InvalidDataException("Steam просит завершить настройку аккаунта в официальном клиенте.");
+                string updatedQr = reply.Text(2);
+                if (login.QrUrl != null && updatedQr.Length != 0 && updatedQr != login.QrUrl)
+                {
+                    login.QrUrl = ValidQrUrl(updatedQr);
+                    if (qrChanged != null)
+                        qrChanged.Report(login.QrUrl);
+                }
                 await Task.Delay(login.Interval, cancel).ConfigureAwait(false);
             }
             throw new TimeoutException("Срок ожидания подтверждения истёк.");
@@ -317,11 +397,10 @@ namespace LocalSteamGuard
             using (var request = new HttpRequestMessage(get ? HttpMethod.Get : HttpMethod.Post, url))
             {
                 if (!get)
-                {
-                    var form = new MultipartFormDataContent();
-                    form.Add(new StringContent(payload), "input_protobuf_encoded");
-                    request.Content = form;
-                }
+                    request.Content = new FormUrlEncodedContent(new[]
+                    {
+                        new KeyValuePair<string, string>("input_protobuf_encoded", payload)
+                    });
                 using (var response = await http.SendAsync(request, cancel).ConfigureAwait(false))
                 {
                     IEnumerable<string> headers;

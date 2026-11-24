@@ -13,7 +13,9 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("Steam Guard для Windows")]
 [assembly: AssemblyDescription("Неофициальный клиент Steam Guard для Windows")]
-[assembly: AssemblyVersion("0.1.0.0")]
+[assembly: AssemblyVersion("0.2.0.0")]
+[assembly: AssemblyFileVersion("0.2.0.0")]
+[assembly: AssemblyProduct("Steam Guard для Windows")]
 
 namespace LocalSteamGuard
 {
@@ -80,7 +82,7 @@ namespace LocalSteamGuard
             this.steam = steam;
             this.accounts = accounts;
             Text = "Steam Guard для Windows";
-            ShowIcon = false;
+            Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleDimensions = new SizeF(96, 96);
             AutoScaleMode = AutoScaleMode.Dpi;
